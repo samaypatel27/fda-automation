@@ -13,6 +13,7 @@ __pycache__/
 venv/
 env/
 ENV/
+myenv/
 
 # Temporary work directory
 temp_work/

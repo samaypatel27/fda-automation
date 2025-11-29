@@ -38,7 +38,6 @@ DOWNLOAD_URL = "https://dailymed-data.nlm.nih.gov/public-release-files/dm_spl_re
 WORK_DIR = Path("temp_work")
 DOWNLOADED_ZIP = WORK_DIR / "downloaded.zip"
 EXTRACTED_DIR = WORK_DIR / "extracted"
-PRESCRIPTION_DIR = EXTRACTED_DIR / "dm_spl_release_human_rx_part1" / "prescription"
 XML_OUTPUT_DIR = WORK_DIR / "xml_files"
 
 # Supabase setup
@@ -109,22 +108,51 @@ def extract_main_zip():
         return False
 
 
-def extract_prescription_zips():
+def find_prescription_directory():
+    """
+    Find the prescription directory dynamically.
+    Searches for a folder named 'prescription' anywhere in the extracted directory.
+    """
+    logger.info(f"Searching for prescription directory in: {EXTRACTED_DIR}")
+    
+    # Search for any directory named 'prescription'
+    for root, dirs, files in os.walk(EXTRACTED_DIR):
+        if 'prescription' in dirs:
+            prescription_path = Path(root) / 'prescription'
+            logger.info(f"✓ Found prescription directory: {prescription_path}")
+            return prescription_path
+    
+    # If not found, log what we did find
+    logger.error(f"✗ Prescription directory not found!")
+    logger.info(f"Contents of {EXTRACTED_DIR}:")
+    for item in EXTRACTED_DIR.iterdir():
+        logger.info(f"  - {item.name} ({'dir' if item.is_dir() else 'file'})")
+        if item.is_dir():
+            for subitem in item.iterdir():
+                logger.info(f"    - {subitem.name} ({'dir' if subitem.is_dir() else 'file'})")
+    
+    return None
+
+
+def extract_prescription_zips(prescription_dir):
     """
     Extract all ZIP files from the prescription directory.
     This is the logic from extract_xml.py.
     """
-    logger.info(f"Extracting prescription ZIP files from: {PRESCRIPTION_DIR}")
+    logger.info(f"Extracting prescription ZIP files from: {prescription_dir}")
     
-    if not PRESCRIPTION_DIR.exists():
-        logger.error(f"Prescription directory not found: {PRESCRIPTION_DIR}")
+    if not prescription_dir or not prescription_dir.exists():
+        logger.error(f"Prescription directory not found or invalid: {prescription_dir}")
         return 0
     
-    zip_files = list(PRESCRIPTION_DIR.glob("*.zip"))
+    zip_files = list(prescription_dir.glob("*.zip"))
     total_zips = len(zip_files)
     
     if total_zips == 0:
         logger.warning("No ZIP files found in prescription directory")
+        logger.info(f"Contents of {prescription_dir}:")
+        for item in prescription_dir.iterdir():
+            logger.info(f"  - {item.name}")
         return 0
     
     logger.info(f"Found {total_zips} prescription ZIP files to process")
@@ -137,14 +165,14 @@ def extract_prescription_zips():
         
         try:
             # Create temporary extraction directory
-            temp_extract_path = PRESCRIPTION_DIR / f"temp_{zip_file.stem}"
+            temp_extract_path = prescription_dir / f"temp_{zip_file.stem}"
             temp_extract_path.mkdir(exist_ok=True)
             
             # Extract zip file
             with zipfile.ZipFile(zip_file, 'r') as zip_ref:
                 zip_ref.extractall(temp_extract_path)
             
-            # Find all XML files in extracted content
+            # Find all XML files in extracted content (recursive search)
             xml_files = list(temp_extract_path.rglob("*.xml"))
             
             # Copy each XML file to output folder with unique name
@@ -460,6 +488,23 @@ def insert_to_supabase(data_dict):
     
     logger.info(f"✓ Insertion complete: {total_inserted}/{len(records)} records inserted")
 
+# Truncate the table because we want to fully clear the data
+def truncate_table5():
+    """
+    Truncate (delete all rows from) table5 before inserting new data.
+    This ensures a fresh start with each run.
+    """
+    logger.info("Truncating table5 (deleting all existing rows)...")
+    
+    try:
+        # Delete all rows from table5
+        response = supabase.table("table5").delete().neq('ndc', '').execute()
+        logger.info("✓ Table5 truncated successfully")
+        return True
+        
+    except Exception as e:
+        logger.error(f"✗ Failed to truncate table5: {e}")
+        return False
 
 def main():
     """Main orchestration function."""
@@ -471,37 +516,47 @@ def main():
     
     try:
         # Step 1: Setup
-        logger.info("\n[STEP 1/7] Setting up work directory...")
+        logger.info("\n[STEP 1/8] Setting up work directory...")
         setup_work_directory()
         
         # Step 2: Download
-        logger.info("\n[STEP 2/7] Downloading FDA data...")
+        logger.info("\n[STEP 2/8] Downloading FDA data...")
         if not download_fda_data():
             raise Exception("Download failed")
         
         # Step 3: Extract main ZIP
-        logger.info("\n[STEP 3/7] Extracting main ZIP file...")
+        logger.info("\n[STEP 3/8] Extracting main ZIP file...")
         if not extract_main_zip():
             raise Exception("Main ZIP extraction failed")
         
+        # Step 3.5: Find prescription directory
+        logger.info("\n[STEP 3.5/8] Locating prescription directory...")
+        prescription_dir = find_prescription_directory()
+        if not prescription_dir:
+            raise Exception("Prescription directory not found in extracted files")
+        
         # Step 4: Extract prescription ZIPs
-        logger.info("\n[STEP 4/7] Extracting prescription ZIP files...")
-        xml_count = extract_prescription_zips()
+        logger.info("\n[STEP 4/8] Extracting prescription ZIP files...")
+        xml_count = extract_prescription_zips(prescription_dir)
         if xml_count == 0:
             raise Exception("No XML files extracted from prescription ZIPs")
         
         # Step 5: Process XML files
-        logger.info("\n[STEP 5/7] Processing XML files for NDC-DUNS mappings...")
+        logger.info("\n[STEP 5/8] Processing XML files for NDC-DUNS mappings...")
         ndc_duns_data = process_all_xml_files()
         if not ndc_duns_data:
             raise Exception("No NDC-DUNS mappings extracted")
         
-        # Step 6: Insert to Supabase
-        logger.info("\n[STEP 6/7] Inserting data into Supabase...")
+        # Step 6: Delete current data in the database(do right before insertion in case someone is using the website at the moment)
+        logger.info("\n[STEP 6/8] Inserting data into Supabase...")
+        truncate_table5()
+        
+        # Step 7: Insert to Supabase
+        logger.info("\n[STEP 7/8] Inserting data into Supabase...")
         insert_to_supabase(ndc_duns_data)
         
         # Step 7: Cleanup
-        logger.info("\n[STEP 7/7] Cleaning up temporary files...")
+        logger.info("\n[STEP 8/8] Cleaning up temporary files...")
         cleanup_work_directory()
         
         # Success summary
