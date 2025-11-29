@@ -30,8 +30,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Load environment variables
-load_dotenv()
+# # Load environment variables - commented out
+# load_dotenv()
 
 # Configuration
 DOWNLOAD_URL = "https://dailymed-data.nlm.nih.gov/public-release-files/dm_spl_release_human_rx_part1.zip"
@@ -198,6 +198,8 @@ def extract_prescription_zips(prescription_dir):
     logger.info(f"✓ Extracted {xml_count} XML files from {total_zips} ZIPs")
     return xml_count
 
+# XML TRAVERSING CODE STARTS HERE
+# -------------------------------------------------------------------------------------------------------------------
 
 def is_manufacturer_activity(code_element):
     """Determine if an actDefinition represents actual manufacturing."""
@@ -415,6 +417,24 @@ def process_xml_file(xml_file):
     except Exception as e:
         return {}
 
+# Truncate the table because we want to fully clear the data
+def truncate_table5():
+    """
+    Truncate (delete all rows from) table5 before inserting new data.
+    This ensures a fresh start with each run.
+    """
+    logger.info("Truncating table5 (deleting all existing rows)...")
+    
+    try:
+        # Delete all rows from table5
+        response = supabase.table("table5").delete().neq('ndc', '').execute()
+        logger.info("✓ Table5 truncated successfully")
+        return True
+        
+    except Exception as e:
+        logger.error(f"✗ Failed to truncate table5: {e}")
+        return False
+
 
 def process_all_xml_files():
     """Process all XML files to extract NDC-DUNS mappings."""
@@ -487,24 +507,10 @@ def insert_to_supabase(data_dict):
                     logger.error(f"  ✗ Failed to insert NDC {record['ndc']}: {record_error}")
     
     logger.info(f"✓ Insertion complete: {total_inserted}/{len(records)} records inserted")
-
-# Truncate the table because we want to fully clear the data
-def truncate_table5():
-    """
-    Truncate (delete all rows from) table5 before inserting new data.
-    This ensures a fresh start with each run.
-    """
-    logger.info("Truncating table5 (deleting all existing rows)...")
     
-    try:
-        # Delete all rows from table5
-        response = supabase.table("table5").delete().neq('ndc', '').execute()
-        logger.info("✓ Table5 truncated successfully")
-        return True
-        
-    except Exception as e:
-        logger.error(f"✗ Failed to truncate table5: {e}")
-        return False
+
+# XML TRAVERSING CODE ENDS HERE (except for the calls in main())
+# -------------------------------------------------------------------------------------------------------------------
 
 def main():
     """Main orchestration function."""
