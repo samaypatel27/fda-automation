@@ -1,0 +1,39 @@
+# Environment files (NEVER commit these!)
+.env
+*.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# Temporary work directory
+temp_work/
+
+# Downloaded files
+*.zip
+prescription/
+xml_files/
+
+# Logs
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter notebooks (if you use them)
+.ipynb_checkpoints/
