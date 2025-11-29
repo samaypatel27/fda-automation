@@ -7,7 +7,7 @@ Automated system to download, process, and store FDA drug label data in Supabase
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                        GitHub Actions                            │
-│                   (Runs every 5 minutes)                         │
+│                   (Runs everyday at 5AM EST)                         │
 └────────────────────────┬────────────────────────────────────────┘
                          │
                          ▼
@@ -40,10 +40,10 @@ Automated system to download, process, and store FDA drug label data in Supabase
 ┌─────────────────────────────────────────────────────────────────┐
 │                      Supabase (table5)                           │
 │                                                                   │
-│   ndc (PRIMARY KEY)  │  duns                                    │
+│   ndc (packager + labeler)  │  duns                                    │
 │   ─────────────────────────────────────────                     │
-│   12345-678-90       │  123456789                               │
-│   98765-432-10       │  987654321                               │
+│   12345-678          │  123456789                               │
+│   98765-432          │  987654321                               │
 │   ...                │  ...                                      │
 └─────────────────────────────────────────────────────────────────┘
 ```
