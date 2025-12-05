@@ -3,7 +3,7 @@ name: Daily FDA Data Update
 on:
   schedule:
     # Run everyday at 5 AM EST
-    - cron: '0 5 * * *'
+    - cron: '0 10 * * *'
   
   # Allow manual triggering from GitHub UI
   workflow_dispatch:
