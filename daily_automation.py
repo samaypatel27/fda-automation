@@ -623,6 +623,97 @@ def insert_to_supabase(records):
     
     logger.info(f"✓ Insertion complete: {total_inserted}/{len(records)} records inserted")
 
+def truncate_joon_ndc_data():
+    """
+    Delete all existing rows from joon_ndc_data before inserting new matched data.
+    
+    This ensures a fresh start with each run of the matching process.
+    Uses a trick with .neq('id', 0) to delete all rows since we can't
+    use .delete() without a filter in Supabase.
+    
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    logger.info("Truncating joon_ndc_data (deleting all existing rows)...")
+    
+    try:
+        # Delete all rows by using a filter that matches everything
+        # .neq('id', 0) means "where id is not equal to 0"
+        # This matches all rows (since id starts at 1 with auto-increment)
+        response = supabase.table("joon_ndc_data").delete().neq('id', 0).execute()
+        logger.info("✓ joon_ndc_data truncated successfully")
+        return True
+        
+    except Exception as e:
+        logger.error(f"✗ Failed to truncate joon_ndc_data: {e}")
+        return False
+
+
+def insert_matched_data_to_joon_ndc_data():
+    """
+    Insert all matching records from table5 and table7 into joon_ndc_data.
+    
+    Joins table5 and table7 on matching DUNS values and inserts:
+    - ndc, ndc_digits from table5
+    - fei, address from table7
+    - duns (from either table, they're equal in the join)
+    
+    This creates a row for EVERY matching combination (not just unique DUNS).
+    If table5 has 3 rows with duns='123' and table7 has 2 rows with duns='123',
+    this creates 6 rows in joon_ndc_data.
+    
+    The id column auto-increments for each inserted row.
+    
+    Note: This uses raw SQL via Supabase RPC call or direct query execution.
+    Supabase Python client doesn't support JOIN operations directly, so we
+    need to use PostgreSQL functions or raw SQL.
+    """
+    logger.info("Inserting matched data from table5 and table7 into joon_ndc_data...")
+    
+    try:
+        # SQL query to insert all matching records
+        sql_query = """
+        INSERT INTO joon_ndc_data (ndc, ndc_digits, fei, address, duns)
+        SELECT 
+            t5.ndc,
+            t5.ndc_digits,
+            t7.fei,
+            t7.address,
+            t5.duns
+        FROM table5 t5
+        INNER JOIN table7 t7 ON t5.duns = t7.duns;
+        """
+        
+        # Execute the SQL query using Supabase RPC
+        # Note: You'll need to create a PostgreSQL function in Supabase to execute this,
+        # OR use the PostgREST API directly
+        response = supabase.rpc('insert_matched_ndc_data').execute()
+        
+        logger.info("✓ Matched data inserted successfully into joon_ndc_data")
+        return True
+        
+    except Exception as e:
+        logger.error(f"✗ Failed to insert matched data: {e}")
+        logger.info("Note: You may need to create a PostgreSQL function in Supabase")
+        logger.info("Function name: insert_matched_ndc_data")
+        logger.info("Function SQL:")
+        logger.info("""
+        CREATE OR REPLACE FUNCTION insert_matched_ndc_data()
+        RETURNS void AS $$
+        BEGIN
+            INSERT INTO joon_ndc_data (ndc, ndc_digits, fei, address, duns)
+            SELECT 
+                t5.ndc,
+                t5.ndc_digits,
+                t7.fei,
+                t7.address,
+                t5.duns
+            FROM table5 t5
+            INNER JOIN table7 t7 ON t5.duns = t7.duns;
+        END;
+        $$ LANGUAGE plpgsql;
+        """)
+        return False
 
 def main():
     """
@@ -636,8 +727,10 @@ def main():
     5. Extract all prescription ZIPs from all 5 parts
     6. Process all XML files (from all 5 parts)
     7. Truncate table5
-    8. Insert all data to Supabase
-    9. Clean up temporary files
+    8. Insert all data to Supabase table5
+    9. Truncate joon_ndc_data
+    10. Insert matched data (table5 JOIN table7) into joon_ndc_data
+    11. Clean up temporary files
     """
     start_time = datetime.now()
     logger.info("="*70)
@@ -647,51 +740,59 @@ def main():
     
     try:
         # Step 1: Setup
-        logger.info("\n[STEP 1/9] Setting up work directory...")
+        logger.info("\n[STEP 1/11] Setting up work directory...")
         setup_work_directory()
         
         # Step 2: Download all 5 ZIP files
-        logger.info("\n[STEP 2/9] Downloading 5 FDA ZIP files...")
+        logger.info("\n[STEP 2/11] Downloading 5 FDA ZIP files...")
         download_count = download_fda_data()
         if download_count == 0:
             raise Exception("All downloads failed")
         logger.info(f"Successfully downloaded {download_count}/5 files")
         
         # Step 3: Extract all 5 main ZIP files
-        logger.info("\n[STEP 3/9] Extracting 5 main ZIP files...")
+        logger.info("\n[STEP 3/11] Extracting 5 main ZIP files...")
         extract_count = extract_main_zips()
         if extract_count == 0:
             raise Exception("All extractions failed")
         logger.info(f"Successfully extracted {extract_count}/5 files")
         
         # Step 4: Find all prescription directories (should be 5)
-        logger.info("\n[STEP 4/9] Locating prescription directories...")
+        logger.info("\n[STEP 4/11] Locating prescription directories...")
         prescription_dirs = find_all_prescription_directories()
         if not prescription_dirs:
             raise Exception("No prescription directories found")
         
         # Step 5: Extract prescription ZIPs from all parts
-        logger.info("\n[STEP 5/9] Extracting prescription ZIP files from all parts...")
+        logger.info("\n[STEP 5/11] Extracting prescription ZIP files from all parts...")
         xml_count = extract_prescription_zips(prescription_dirs)
         if xml_count == 0:
             raise Exception("No XML files extracted from prescription ZIPs")
         
         # Step 6: Process all XML files using new establishments2 logic
-        logger.info("\n[STEP 6/9] Processing XML files for establishment data...")
+        logger.info("\n[STEP 6/11] Processing XML files for establishment data...")
         all_records = process_all_xml_files()
         if not all_records:
             raise Exception("No records extracted from XML files")
         
         # Step 7: Truncate table5 (delete all existing data)
-        logger.info("\n[STEP 7/9] Truncating table5...")
+        logger.info("\n[STEP 7/11] Truncating table5...")
         truncate_table5()
         
-        # Step 8: Insert all data to Supabase
-        logger.info("\n[STEP 8/9] Inserting data into Supabase...")
+        # Step 8: Insert all data to Supabase table5
+        logger.info("\n[STEP 8/11] Inserting data into Supabase table5...")
         insert_to_supabase(all_records)
         
-        # Step 9: Cleanup
-        logger.info("\n[STEP 9/9] Cleaning up temporary files...")
+        # Step 9: Truncate joon_ndc_data
+        logger.info("\n[STEP 9/11] Truncating joon_ndc_data...")
+        truncate_joon_ndc_data()
+        
+        # Step 10: Insert matched data into joon_ndc_data
+        logger.info("\n[STEP 10/11] Inserting matched data into joon_ndc_data...")
+        insert_matched_data_to_joon_ndc_data()
+        
+        # Step 11: Cleanup
+        logger.info("\n[STEP 11/11] Cleaning up temporary files...")
         cleanup_work_directory()
         
         # Success summary
@@ -707,7 +808,8 @@ def main():
         logger.info(f"ZIP files extracted: {extract_count}/5")
         logger.info(f"Prescription directories found: {len(prescription_dirs)}")
         logger.info(f"XML files processed: {xml_count}")
-        logger.info(f"Records inserted to database: {len(all_records)}")
+        logger.info(f"Records inserted to table5: {len(all_records)}")
+        logger.info(f"Matched records inserted to joon_ndc_data: [check logs above]")
         logger.info("="*70)
         
     except Exception as e:
