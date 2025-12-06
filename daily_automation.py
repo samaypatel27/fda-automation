@@ -1,5 +1,5 @@
 """
-Daily FDA Drug Label Data Automation Script - Version 2
+Daily FDA Drug Label Data Automation Script - Version 2 FINAL
 
 MAJOR CHANGES FROM V1:
 1. Downloads 5 ZIP files (part1-part5) instead of 1
@@ -9,14 +9,17 @@ MAJOR CHANGES FROM V1:
 5. No primary key - allows duplicate records
 6. Adds ndc_digits column (NDC without dashes)
 7. Uses INSERT instead of UPSERT
+8. DISK SPACE OPTIMIZATIONS for GitHub Actions (deletes ZIPs after use)
+9. Joins table5 and table7 to populate joon_ndc_data
 
 This script:
 1. Downloads 5 FDA drug label ZIP files from DailyMed (part1-part5)
-2. Extracts each ZIP to working directories
+2. Extracts each ZIP to working directories (deletes ZIPs after extraction)
 3. Extracts all XML files from nested prescription ZIPs into single xml_files folder
 4. Processes XML files using establishments2() logic to extract ALL NDC-DUNS combinations
 5. Inserts data into Supabase table5 (allows nulls and duplicates)
-6. Cleans up temporary files
+6. Joins table5 with table7 to populate joon_ndc_data
+7. Cleans up temporary files
 
 Designed to run daily via GitHub Actions or other schedulers.
 """
@@ -144,12 +147,15 @@ def download_fda_data():
 
 def extract_main_zips():
     """
-    Extract all 5 main ZIP files.
+    Extract all 5 main ZIP files and DELETE them immediately after extraction.
     
     Each ZIP extracts to a folder like:
     - dm_spl_release_human_rx_part1/
     - dm_spl_release_human_rx_part2/
     - etc.
+    
+    DISK SPACE OPTIMIZATION:
+    Deletes each ZIP immediately after extraction to stay under GitHub Actions' 14GB limit.
     
     All extracted folders go into EXTRACTED_DIR.
     
@@ -174,6 +180,13 @@ def extract_main_zips():
             
             logger.info(f"✓ Extracted: {filename}")
             successful_extractions += 1
+            
+            # CRITICAL DISK SPACE OPTIMIZATION:
+            # Delete the downloaded ZIP immediately after extraction to free space
+            # GitHub Actions runners only have ~14GB free disk space
+            # By deleting each ZIP (600MB) after extraction, we save 3GB total
+            zip_path.unlink()
+            logger.info(f"  Deleted downloaded ZIP to free disk space")
             
         except Exception as e:
             logger.error(f"✗ Extraction failed for {filename}: {e}")
@@ -230,6 +243,7 @@ def extract_prescription_zips(prescription_dirs):
     3. Recursively finds all .xml files in the extraction
     4. Copies XMLs to the central XML_OUTPUT_DIR with unique names
     5. Cleans up the temporary extraction folder
+    6. DELETES the prescription ZIP after processing (DISK SPACE OPTIMIZATION)
     
     Args:
         prescription_dirs: List of Path objects to prescription directories
@@ -307,6 +321,17 @@ def extract_prescription_zips(prescription_dirs):
                     shutil.rmtree(temp_extract_path)
         
         logger.info(f"✓ Part {dir_idx} complete: {part_xml_count} XMLs extracted")
+        
+        # CRITICAL DISK SPACE OPTIMIZATION:
+        # Delete all prescription ZIPs after processing this part
+        # This frees up ~2-3GB per part, allowing us to stay under the 14GB limit
+        logger.info(f"  Cleaning up prescription ZIPs from Part {dir_idx}...")
+        for zip_file in zip_files:
+            try:
+                zip_file.unlink()
+            except Exception:
+                pass  # Ignore errors if file already deleted
+        logger.info(f"  Freed disk space from Part {dir_idx}")
     
     logger.info(f"\n✓ TOTAL: Extracted {total_xml_count} XML files from {total_zip_count} ZIPs across all parts")
     return total_xml_count
@@ -623,6 +648,7 @@ def insert_to_supabase(records):
     
     logger.info(f"✓ Insertion complete: {total_inserted}/{len(records)} records inserted")
 
+
 def truncate_joon_ndc_data():
     """
     Delete all existing rows from joon_ndc_data before inserting new matched data.
@@ -715,6 +741,7 @@ def insert_matched_data_to_joon_ndc_data():
         """)
         return False
 
+
 def main():
     """
     Main orchestration function.
@@ -722,9 +749,9 @@ def main():
     Orchestrates the entire process:
     1. Setup work directories
     2. Download 5 ZIP files
-    3. Extract 5 main ZIPs
+    3. Extract 5 main ZIPs (deletes ZIPs after extraction)
     4. Find 5 prescription directories
-    5. Extract all prescription ZIPs from all 5 parts
+    5. Extract all prescription ZIPs from all 5 parts (deletes ZIPs after each part)
     6. Process all XML files (from all 5 parts)
     7. Truncate table5
     8. Insert all data to Supabase table5
@@ -750,7 +777,7 @@ def main():
             raise Exception("All downloads failed")
         logger.info(f"Successfully downloaded {download_count}/5 files")
         
-        # Step 3: Extract all 5 main ZIP files
+        # Step 3: Extract all 5 main ZIP files (deletes ZIPs after extraction)
         logger.info("\n[STEP 3/11] Extracting 5 main ZIP files...")
         extract_count = extract_main_zips()
         if extract_count == 0:
@@ -763,7 +790,7 @@ def main():
         if not prescription_dirs:
             raise Exception("No prescription directories found")
         
-        # Step 5: Extract prescription ZIPs from all parts
+        # Step 5: Extract prescription ZIPs from all parts (deletes ZIPs after each part)
         logger.info("\n[STEP 5/11] Extracting prescription ZIP files from all parts...")
         xml_count = extract_prescription_zips(prescription_dirs)
         if xml_count == 0:
