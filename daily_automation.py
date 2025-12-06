@@ -1,7 +1,12 @@
 """
-Daily FDA Drug Label Data Automation Script - Version 2 FINAL
+Daily FDA Drug Label Data Automation Script - Version 2.1 FINAL
 
-MAJOR CHANGES FROM V1:
+MAJOR CHANGES FROM V2:
+1. SEQUENTIAL PROCESSING - Process one part at a time instead of all 5 at once
+2. IMMEDIATE CLEANUP - Delete each part's data before starting the next
+3. DISK SPACE OPTIMIZATION - Never have more than 1 part on disk at any time
+
+CHANGES FROM V1:
 1. Downloads 5 ZIP files (part1-part5) instead of 1
 2. Processes all 5 parts into a single xml_files directory
 3. Uses new XML parsing logic (establishments2 function)
@@ -13,13 +18,17 @@ MAJOR CHANGES FROM V1:
 9. Joins table5 and table7 to populate joon_ndc_data
 
 This script:
-1. Downloads 5 FDA drug label ZIP files from DailyMed (part1-part5)
-2. Extracts each ZIP to working directories (deletes ZIPs after extraction)
-3. Extracts all XML files from nested prescription ZIPs into single xml_files folder
-4. Processes XML files using establishments2() logic to extract ALL NDC-DUNS combinations
-5. Inserts data into Supabase table5 (allows nulls and duplicates)
-6. Joins table5 with table7 to populate joon_ndc_data
-7. Cleans up temporary files
+1. FOR EACH PART (1-5):
+   - Downloads FDA drug label ZIP file from DailyMed
+   - Extracts ZIP and deletes it immediately
+   - Extracts all XML files from nested prescription ZIPs
+   - Processes XMLs using establishments2() logic to extract ALL NDC-DUNS combinations
+   - Stores records in memory
+   - Deletes all part data (extracted folders + XMLs)
+2. After all parts processed:
+   - Inserts all data into Supabase table5 (allows nulls and duplicates)
+   - Joins table5 with table7 to populate joon_ndc_data
+   - Cleans up any remaining temporary files
 
 Designed to run daily via GitHub Actions or other schedulers.
 """
@@ -58,9 +67,9 @@ DOWNLOAD_FILES = [
 ]
 
 WORK_DIR = Path("temp_work")
-DOWNLOADS_DIR = WORK_DIR / "downloads"  # Store all 5 downloaded ZIPs here
-EXTRACTED_DIR = WORK_DIR / "extracted"  # Extract all 5 ZIPs here
-XML_OUTPUT_DIR = WORK_DIR / "xml_files"  # ALL XMLs from all 5 parts go here
+DOWNLOADS_DIR = WORK_DIR / "downloads"  # Store downloaded ZIP here (one at a time)
+EXTRACTED_DIR = WORK_DIR / "extracted"  # Extract ZIP here (one at a time)
+XML_OUTPUT_DIR = WORK_DIR / "xml_files"  # Store XMLs temporarily during processing
 
 # Supabase setup
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -85,9 +94,9 @@ def setup_work_directory():
     """
     Create fresh work directory structure.
     Creates three directories:
-    - downloads: for the 5 downloaded ZIP files
-    - extracted: for the 5 extracted folders
-    - xml_files: for ALL XMLs from all 5 parts (single collection point)
+    - downloads: for the downloaded ZIP file (one at a time)
+    - extracted: for the extracted folder (one at a time)
+    - xml_files: for XMLs during processing (cleaned up after each part)
     """
     cleanup_work_directory()
     WORK_DIR.mkdir(exist_ok=True)
@@ -95,246 +104,6 @@ def setup_work_directory():
     EXTRACTED_DIR.mkdir(exist_ok=True)
     XML_OUTPUT_DIR.mkdir(exist_ok=True)
     logger.info(f"Created work directory structure: {WORK_DIR}")
-
-
-def download_fda_data():
-    """
-    Download all 5 FDA drug label ZIP files from DailyMed.
-    
-    Downloads part1 through part5 sequentially.
-    Each file is ~500-700MB, so total download is ~3GB.
-    
-    Returns:
-        int: Number of files successfully downloaded (should be 5)
-    """
-    logger.info(f"Downloading {len(DOWNLOAD_FILES)} FDA ZIP files...")
-    successful_downloads = 0
-    
-    for idx, filename in enumerate(DOWNLOAD_FILES, 1):
-        download_url = BASE_DOWNLOAD_URL + filename
-        output_path = DOWNLOADS_DIR / filename
-        
-        logger.info(f"\n[{idx}/{len(DOWNLOAD_FILES)}] Downloading: {filename}")
-        logger.info(f"URL: {download_url}")
-        
-        try:
-            response = requests.get(download_url, stream=True)
-            response.raise_for_status()
-            
-            total_size = int(response.headers.get('content-length', 0))
-            logger.info(f"Size: {total_size / (1024*1024):.2f} MB")
-            
-            # Download with progress logging every 10MB
-            with open(output_path, 'wb') as f:
-                downloaded = 0
-                for chunk in response.iter_content(chunk_size=8192):
-                    f.write(chunk)
-                    downloaded += len(chunk)
-                    if downloaded % (10 * 1024 * 1024) == 0:  # Log every 10MB
-                        logger.info(f"  Downloaded: {downloaded / (1024*1024):.2f} MB")
-            
-            logger.info(f"✓ Download complete: {filename}")
-            successful_downloads += 1
-            
-        except Exception as e:
-            logger.error(f"✗ Download failed for {filename}: {e}")
-            # Continue with other files even if one fails
-            continue
-    
-    logger.info(f"\n✓ Downloaded {successful_downloads}/{len(DOWNLOAD_FILES)} files successfully")
-    return successful_downloads
-
-
-def extract_main_zips():
-    """
-    Extract all 5 main ZIP files and DELETE them immediately after extraction.
-    
-    Each ZIP extracts to a folder like:
-    - dm_spl_release_human_rx_part1/
-    - dm_spl_release_human_rx_part2/
-    - etc.
-    
-    DISK SPACE OPTIMIZATION:
-    Deletes each ZIP immediately after extraction to stay under GitHub Actions' 14GB limit.
-    
-    All extracted folders go into EXTRACTED_DIR.
-    
-    Returns:
-        int: Number of ZIPs successfully extracted
-    """
-    logger.info(f"Extracting {len(DOWNLOAD_FILES)} main ZIP files...")
-    successful_extractions = 0
-    
-    for idx, filename in enumerate(DOWNLOAD_FILES, 1):
-        zip_path = DOWNLOADS_DIR / filename
-        
-        if not zip_path.exists():
-            logger.warning(f"[{idx}/{len(DOWNLOAD_FILES)}] ZIP not found: {filename}")
-            continue
-        
-        logger.info(f"[{idx}/{len(DOWNLOAD_FILES)}] Extracting: {filename}")
-        
-        try:
-            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-                zip_ref.extractall(EXTRACTED_DIR)
-            
-            logger.info(f"✓ Extracted: {filename}")
-            successful_extractions += 1
-            
-            # CRITICAL DISK SPACE OPTIMIZATION:
-            # Delete the downloaded ZIP immediately after extraction to free space
-            # GitHub Actions runners only have ~14GB free disk space
-            # By deleting each ZIP (600MB) after extraction, we save 3GB total
-            zip_path.unlink()
-            logger.info(f"  Deleted downloaded ZIP to free disk space")
-            
-        except Exception as e:
-            logger.error(f"✗ Extraction failed for {filename}: {e}")
-            continue
-    
-    logger.info(f"✓ Extracted {successful_extractions}/{len(DOWNLOAD_FILES)} files to: {EXTRACTED_DIR}")
-    return successful_extractions
-
-
-def find_all_prescription_directories():
-    """
-    Find all 'prescription' directories in the extracted folders.
-    
-    Searches for folders named 'prescription' within each of the 5 extracted parts.
-    Expected structure:
-    - extracted/dm_spl_release_human_rx_part1/prescription/
-    - extracted/dm_spl_release_human_rx_part2/prescription/
-    - etc.
-    
-    Returns:
-        list: List of Path objects pointing to prescription directories
-    """
-    logger.info(f"Searching for prescription directories in: {EXTRACTED_DIR}")
-    prescription_dirs = []
-    
-    # Walk through all directories looking for 'prescription' folders
-    for root, dirs, files in os.walk(EXTRACTED_DIR):
-        if 'prescription' in dirs:
-            prescription_path = Path(root) / 'prescription'
-            prescription_dirs.append(prescription_path)
-            logger.info(f"✓ Found prescription directory: {prescription_path}")
-    
-    if not prescription_dirs:
-        # If not found, log what we did find to help debug
-        logger.error(f"✗ No prescription directories found!")
-        logger.info(f"Contents of {EXTRACTED_DIR}:")
-        for item in EXTRACTED_DIR.iterdir():
-            logger.info(f"  - {item.name} ({'dir' if item.is_dir() else 'file'})")
-            if item.is_dir():
-                for subitem in item.iterdir():
-                    logger.info(f"    - {subitem.name} ({'dir' if subitem.is_dir() else 'file'})")
-    
-    logger.info(f"✓ Found {len(prescription_dirs)} prescription directories total")
-    return prescription_dirs
-
-
-def extract_prescription_zips(prescription_dirs):
-    """
-    Extract all prescription ZIP files from ALL prescription directories.
-    
-    For each prescription directory (5 total), this function:
-    1. Finds all .zip files
-    2. Extracts each ZIP to a temporary folder
-    3. Recursively finds all .xml files in the extraction
-    4. Copies XMLs to the central XML_OUTPUT_DIR with unique names
-    5. Cleans up the temporary extraction folder
-    6. DELETES the prescription ZIP after processing (DISK SPACE OPTIMIZATION)
-    
-    Args:
-        prescription_dirs: List of Path objects to prescription directories
-    
-    Returns:
-        int: Total number of XML files extracted from ALL parts
-    """
-    logger.info(f"Processing {len(prescription_dirs)} prescription directories...")
-    
-    total_xml_count = 0
-    total_zip_count = 0
-    
-    # Process each prescription directory (part1, part2, etc.)
-    for dir_idx, prescription_dir in enumerate(prescription_dirs, 1):
-        logger.info(f"\n[Part {dir_idx}/{len(prescription_dirs)}] Processing: {prescription_dir.name}")
-        
-        if not prescription_dir.exists():
-            logger.error(f"Directory does not exist: {prescription_dir}")
-            continue
-        
-        # Get all ZIP files in this prescription directory
-        zip_files = list(prescription_dir.glob("*.zip"))
-        
-        if not zip_files:
-            logger.warning(f"No ZIP files found in {prescription_dir}")
-            continue
-        
-        logger.info(f"Found {len(zip_files)} ZIP files in this part")
-        total_zip_count += len(zip_files)
-        
-        part_xml_count = 0
-        
-        # Process each ZIP file in this prescription directory
-        for idx, zip_file in enumerate(zip_files, 1):
-            # Log progress every 100 ZIPs
-            if idx % 100 == 0:
-                logger.info(f"  Progress: {idx}/{len(zip_files)} ZIPs processed... ({part_xml_count} XMLs from this part)")
-            
-            try:
-                # Create temporary extraction directory
-                # Use prescription_dir as base to avoid conflicts between parts
-                temp_extract_path = prescription_dir / f"temp_{zip_file.stem}"
-                temp_extract_path.mkdir(exist_ok=True)
-                
-                # Extract the ZIP file
-                with zipfile.ZipFile(zip_file, 'r') as zip_ref:
-                    zip_ref.extractall(temp_extract_path)
-                
-                # Find ALL XML files recursively (in case XMLs are nested in folders)
-                xml_files = list(temp_extract_path.rglob("*.xml"))
-                
-                # Copy each XML to the central xml_files directory
-                for xml_file in xml_files:
-                    # Create unique filename: partX_zipname_xmlname
-                    # This prevents conflicts between parts with same ZIP names
-                    output_filename = f"{prescription_dir.parent.name}_{zip_file.stem}_{xml_file.name}"
-                    output_path = XML_OUTPUT_DIR / output_filename
-                    shutil.copy2(xml_file, output_path)
-                    part_xml_count += 1
-                    total_xml_count += 1
-                
-                # Clean up temporary extraction directory
-                shutil.rmtree(temp_extract_path)
-                
-            except zipfile.BadZipFile:
-                logger.error(f"Bad ZIP file: {zip_file.name}")
-                # Clean up if temp directory exists
-                if temp_extract_path.exists():
-                    shutil.rmtree(temp_extract_path)
-                    
-            except Exception as e:
-                logger.error(f"Error processing {zip_file.name}: {e}")
-                # Clean up if temp directory exists
-                if temp_extract_path.exists():
-                    shutil.rmtree(temp_extract_path)
-        
-        logger.info(f"✓ Part {dir_idx} complete: {part_xml_count} XMLs extracted")
-        
-        # CRITICAL DISK SPACE OPTIMIZATION:
-        # Delete all prescription ZIPs after processing this part
-        # This frees up ~2-3GB per part, allowing us to stay under the 14GB limit
-        logger.info(f"  Cleaning up prescription ZIPs from Part {dir_idx}...")
-        for zip_file in zip_files:
-            try:
-                zip_file.unlink()
-            except Exception:
-                pass  # Ignore errors if file already deleted
-        logger.info(f"  Freed disk space from Part {dir_idx}")
-    
-    logger.info(f"\n✓ TOTAL: Extracted {total_xml_count} XML files from {total_zip_count} ZIPs across all parts")
-    return total_xml_count
 
 
 # =============================================================================
@@ -492,86 +261,6 @@ def process_xml_file(xml_file):
         # If XML parsing fails, return empty list (skip this file)
         logger.error(f"Error processing {xml_file.name}: {e}")
         return []
-
-
-def process_all_xml_files():
-    """
-    Process ALL XML files in the xml_files directory.
-    
-    This now processes XMLs from all 5 parts (they're all in one directory).
-    Uses the new establishments2() logic instead of the old manufacturer-focused approach.
-    
-    Returns:
-        list: List of all records (allows duplicates, allows nulls)
-    """
-    logger.info(f"Processing XML files from: {XML_OUTPUT_DIR}")
-    
-    xml_files = list(XML_OUTPUT_DIR.glob("*.xml"))
-    
-    if not xml_files:
-        logger.warning("No XML files found to process")
-        return []
-    
-    logger.info(f"Found {len(xml_files)} XML files to process")
-    
-    all_records = []  # List instead of dict - we want ALL records, including duplicates
-    
-    # Statistics tracking
-    stats = {
-        'files_processed': 0,
-        'files_with_data': 0,
-        'files_without_data': 0,
-        'total_records': 0,
-        'has_both': 0,
-        'has_ndc_only': 0,
-        'has_duns_only': 0
-    }
-    
-    # Process each XML file
-    for i, xml_file in enumerate(xml_files, 1):
-        records = process_xml_file(xml_file)
-        
-        stats['files_processed'] += 1
-        
-        if records:
-            stats['files_with_data'] += 1
-            stats['total_records'] += len(records)
-            
-            # Add all records to our list (no deduplication)
-            for record in records:
-                all_records.append(record)
-                
-                # Track statistics
-                if record['ndc'] and record['duns']:
-                    stats['has_both'] += 1
-                elif record['ndc']:
-                    stats['has_ndc_only'] += 1
-                elif record['duns']:
-                    stats['has_duns_only'] += 1
-        else:
-            stats['files_without_data'] += 1
-        
-        # Log progress every 1000 files
-        if i % 1000 == 0:
-            logger.info(f"Progress: {i}/{len(xml_files)} files processed... ({stats['total_records']} records so far)")
-    
-    # Log final statistics
-    logger.info(f"\n✓ Processing complete:")
-    logger.info(f"  - Files processed: {stats['files_processed']}")
-    logger.info(f"  - Files with data: {stats['files_with_data']}")
-    logger.info(f"  - Files without data: {stats['files_without_data']}")
-    logger.info(f"  - Total records: {stats['total_records']}")
-    logger.info(f"  - Has both NDC and DUNS: {stats['has_both']}")
-    logger.info(f"  - Has NDC only (DUNS is null): {stats['has_ndc_only']}")
-    logger.info(f"  - Has DUNS only (NDC is null): {stats['has_duns_only']}")
-    
-    # Count unique non-null values for informational purposes
-    unique_ndcs = len(set(r['ndc'] for r in all_records if r['ndc'] is not None))
-    unique_duns = len(set(r['duns'] for r in all_records if r['duns'] is not None))
-    logger.info(f"  - Unique NDCs (non-null): {unique_ndcs}")
-    logger.info(f"  - Unique DUNS (non-null): {unique_duns}")
-    
-    return all_records
 
 
 def truncate_table5():
@@ -742,22 +431,185 @@ def insert_matched_data_to_joon_ndc_data():
         return False
 
 
+def process_single_part(part_number, part_filename):
+    """
+    Process a single part completely before moving to the next.
+    
+    This function downloads, extracts, and processes one part at a time,
+    then cleans up that part's data before moving to the next part.
+    
+    This sequential approach minimizes disk usage - we only have one part's
+    data on disk at a time instead of all 5 parts.
+    
+    Args:
+        part_number: Part number (1-5)
+        part_filename: Filename of the ZIP to download (e.g., "dm_spl_release_human_rx_part1.zip")
+    
+    Returns:
+        list: All records extracted from this part
+    """
+    logger.info(f"\n{'='*70}")
+    logger.info(f"PROCESSING PART {part_number}/5: {part_filename}")
+    logger.info(f"{'='*70}")
+    
+    part_records = []
+    
+    try:
+        # Step A: Download this part's ZIP
+        logger.info(f"\n[Part {part_number} - Step A] Downloading {part_filename}...")
+        download_url = BASE_DOWNLOAD_URL + part_filename
+        zip_path = DOWNLOADS_DIR / part_filename
+        
+        response = requests.get(download_url, stream=True)
+        response.raise_for_status()
+        
+        total_size = int(response.headers.get('content-length', 0))
+        logger.info(f"Size: {total_size / (1024*1024):.2f} MB")
+        
+        with open(zip_path, 'wb') as f:
+            downloaded = 0
+            for chunk in response.iter_content(chunk_size=8192):
+                f.write(chunk)
+                downloaded += len(chunk)
+                if downloaded % (10 * 1024 * 1024) == 0:
+                    logger.info(f"  Downloaded: {downloaded / (1024*1024):.2f} MB")
+        
+        logger.info(f"✓ Download complete")
+        
+        # Step B: Extract this part's main ZIP
+        logger.info(f"\n[Part {part_number} - Step B] Extracting main ZIP...")
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            zip_ref.extractall(EXTRACTED_DIR)
+        logger.info(f"✓ Extracted successfully")
+        
+        # Delete the downloaded ZIP immediately to free space
+        zip_path.unlink()
+        logger.info(f"  Deleted downloaded ZIP to free disk space")
+        
+        # Step C: Find prescription directory for this part
+        logger.info(f"\n[Part {part_number} - Step C] Locating prescription directory...")
+        prescription_dir = None
+        for root, dirs, files in os.walk(EXTRACTED_DIR):
+            if 'prescription' in dirs:
+                prescription_dir = Path(root) / 'prescription'
+                logger.info(f"✓ Found: {prescription_dir}")
+                break
+        
+        if not prescription_dir:
+            raise Exception(f"No prescription directory found for part {part_number}")
+        
+        # Step D: Extract prescription ZIPs and process XMLs
+        logger.info(f"\n[Part {part_number} - Step D] Processing prescription ZIPs...")
+        
+        zip_files = list(prescription_dir.glob("*.zip"))
+        logger.info(f"Found {len(zip_files)} prescription ZIP files")
+        
+        xml_count = 0
+        for idx, zip_file in enumerate(zip_files, 1):
+            if idx % 100 == 0:
+                logger.info(f"  Progress: {idx}/{len(zip_files)} ZIPs processed...")
+            
+            try:
+                temp_extract_path = prescription_dir / f"temp_{zip_file.stem}"
+                temp_extract_path.mkdir(exist_ok=True)
+                
+                with zipfile.ZipFile(zip_file, 'r') as zip_ref:
+                    zip_ref.extractall(temp_extract_path)
+                
+                xml_files = list(temp_extract_path.rglob("*.xml"))
+                
+                for xml_file in xml_files:
+                    output_filename = f"part{part_number}_{zip_file.stem}_{xml_file.name}"
+                    output_path = XML_OUTPUT_DIR / output_filename
+                    shutil.copy2(xml_file, output_path)
+                    xml_count += 1
+                
+                shutil.rmtree(temp_extract_path)
+                
+            except Exception as e:
+                logger.error(f"Error processing {zip_file.name}: {e}")
+                if temp_extract_path.exists():
+                    shutil.rmtree(temp_extract_path)
+        
+        logger.info(f"✓ Extracted {xml_count} XML files from part {part_number}")
+        
+        # Step E: Process XMLs from this part
+        logger.info(f"\n[Part {part_number} - Step E] Processing XML files...")
+        
+        xml_files = list(XML_OUTPUT_DIR.glob(f"part{part_number}_*.xml"))
+        logger.info(f"Processing {len(xml_files)} XML files from part {part_number}")
+        
+        for i, xml_file in enumerate(xml_files, 1):
+            records = process_xml_file(xml_file)
+            if records:
+                part_records.extend(records)
+            
+            if i % 1000 == 0:
+                logger.info(f"  Progress: {i}/{len(xml_files)} XMLs processed... ({len(part_records)} records)")
+        
+        logger.info(f"✓ Extracted {len(part_records)} records from part {part_number}")
+        
+        # Step F: Cleanup this part's data to free disk space
+        logger.info(f"\n[Part {part_number} - Step F] Cleaning up part {part_number} data...")
+        
+        # Delete extracted directory for this part
+        for item in EXTRACTED_DIR.iterdir():
+            if item.is_dir():
+                shutil.rmtree(item)
+                logger.info(f"  Deleted extracted directory: {item.name}")
+        
+        # Delete XMLs from this part (we've already extracted the records)
+        for xml_file in XML_OUTPUT_DIR.glob(f"part{part_number}_*.xml"):
+            xml_file.unlink()
+        
+        logger.info(f"✓ Cleanup complete for part {part_number}")
+        logger.info(f"\n{'='*70}")
+        logger.info(f"✓ PART {part_number}/5 COMPLETE: {len(part_records)} records extracted")
+        logger.info(f"{'='*70}\n")
+        
+        return part_records
+        
+    except Exception as e:
+        logger.error(f"✗ Error processing part {part_number}: {e}")
+        # Cleanup on error
+        logger.info(f"Cleaning up part {part_number} after error...")
+        for item in EXTRACTED_DIR.iterdir():
+            if item.is_dir():
+                try:
+                    shutil.rmtree(item)
+                except:
+                    pass
+        for xml_file in XML_OUTPUT_DIR.glob(f"part{part_number}_*.xml"):
+            try:
+                xml_file.unlink()
+            except:
+                pass
+        raise
+
+
 def main():
     """
     Main orchestration function.
     
+    NEW STRATEGY FOR DISK SPACE:
+    Instead of downloading/extracting all 5 parts at once, we process them
+    sequentially - one complete part at a time. This keeps disk usage minimal.
+    
     Orchestrates the entire process:
     1. Setup work directories
-    2. Download 5 ZIP files
-    3. Extract 5 main ZIPs (deletes ZIPs after extraction)
-    4. Find 5 prescription directories
-    5. Extract all prescription ZIPs from all 5 parts (deletes ZIPs after each part)
-    6. Process all XML files (from all 5 parts)
-    7. Truncate table5
-    8. Insert all data to Supabase table5
-    9. Truncate joon_ndc_data
-    10. Insert matched data (table5 JOIN table7) into joon_ndc_data
-    11. Clean up temporary files
+    2. FOR EACH PART (1-5):
+       - Download part ZIP
+       - Extract main ZIP (delete ZIP after)
+       - Find prescription directory
+       - Extract and process prescription ZIPs
+       - Extract records from XMLs
+       - Delete part's data (extracted folders + XMLs)
+    3. Combine all records from all parts
+    4. Truncate table5
+    5. Insert all data to Supabase table5
+    6. Truncate joon_ndc_data
+    7. Insert matched data (table5 JOIN table7) into joon_ndc_data
+    8. Clean up remaining temporary files
     """
     start_time = datetime.now()
     logger.info("="*70)
@@ -767,59 +619,54 @@ def main():
     
     try:
         # Step 1: Setup
-        logger.info("\n[STEP 1/11] Setting up work directory...")
+        logger.info("\n[STEP 1/7] Setting up work directory...")
         setup_work_directory()
         
-        # Step 2: Download all 5 ZIP files
-        logger.info("\n[STEP 2/11] Downloading 5 FDA ZIP files...")
-        download_count = download_fda_data()
-        if download_count == 0:
-            raise Exception("All downloads failed")
-        logger.info(f"Successfully downloaded {download_count}/5 files")
+        # Step 2: Process all 5 parts sequentially
+        logger.info("\n[STEP 2/7] Processing 5 parts sequentially...")
+        logger.info("NOTE: Each part is fully processed and cleaned up before the next begins")
+        logger.info("This minimizes disk usage for GitHub Actions")
         
-        # Step 3: Extract all 5 main ZIP files (deletes ZIPs after extraction)
-        logger.info("\n[STEP 3/11] Extracting 5 main ZIP files...")
-        extract_count = extract_main_zips()
-        if extract_count == 0:
-            raise Exception("All extractions failed")
-        logger.info(f"Successfully extracted {extract_count}/5 files")
+        all_records = []
+        parts_processed = 0
         
-        # Step 4: Find all prescription directories (should be 5)
-        logger.info("\n[STEP 4/11] Locating prescription directories...")
-        prescription_dirs = find_all_prescription_directories()
-        if not prescription_dirs:
-            raise Exception("No prescription directories found")
+        for part_num, part_file in enumerate(DOWNLOAD_FILES, 1):
+            try:
+                part_records = process_single_part(part_num, part_file)
+                all_records.extend(part_records)
+                parts_processed += 1
+            except Exception as e:
+                logger.error(f"Failed to process part {part_num}: {e}")
+                logger.info("Continuing with remaining parts...")
+                continue
         
-        # Step 5: Extract prescription ZIPs from all parts (deletes ZIPs after each part)
-        logger.info("\n[STEP 5/11] Extracting prescription ZIP files from all parts...")
-        xml_count = extract_prescription_zips(prescription_dirs)
-        if xml_count == 0:
-            raise Exception("No XML files extracted from prescription ZIPs")
+        if parts_processed == 0:
+            raise Exception("All parts failed to process")
         
-        # Step 6: Process all XML files using new establishments2 logic
-        logger.info("\n[STEP 6/11] Processing XML files for establishment data...")
-        all_records = process_all_xml_files()
+        logger.info(f"\n✓ Successfully processed {parts_processed}/5 parts")
+        logger.info(f"✓ Total records extracted: {len(all_records)}")
+        
         if not all_records:
-            raise Exception("No records extracted from XML files")
+            raise Exception("No records extracted from any parts")
         
-        # Step 7: Truncate table5 (delete all existing data)
-        logger.info("\n[STEP 7/11] Truncating table5...")
+        # Step 3: Truncate table5 (delete all existing data)
+        logger.info("\n[STEP 3/7] Truncating table5...")
         truncate_table5()
         
-        # Step 8: Insert all data to Supabase table5
-        logger.info("\n[STEP 8/11] Inserting data into Supabase table5...")
+        # Step 4: Insert all data to Supabase table5
+        logger.info("\n[STEP 4/7] Inserting data into Supabase table5...")
         insert_to_supabase(all_records)
         
-        # Step 9: Truncate joon_ndc_data
-        logger.info("\n[STEP 9/11] Truncating joon_ndc_data...")
+        # Step 5: Truncate joon_ndc_data
+        logger.info("\n[STEP 5/7] Truncating joon_ndc_data...")
         truncate_joon_ndc_data()
         
-        # Step 10: Insert matched data into joon_ndc_data
-        logger.info("\n[STEP 10/11] Inserting matched data into joon_ndc_data...")
+        # Step 6: Insert matched data into joon_ndc_data
+        logger.info("\n[STEP 6/7] Inserting matched data into joon_ndc_data...")
         insert_matched_data_to_joon_ndc_data()
         
-        # Step 11: Cleanup
-        logger.info("\n[STEP 11/11] Cleaning up temporary files...")
+        # Step 7: Final cleanup
+        logger.info("\n[STEP 7/7] Cleaning up remaining temporary files...")
         cleanup_work_directory()
         
         # Success summary
@@ -831,10 +678,8 @@ def main():
         logger.info("="*70)
         logger.info(f"Run completed at: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
         logger.info(f"Total duration: {duration:.2f} minutes")
-        logger.info(f"ZIP files downloaded: {download_count}/5")
-        logger.info(f"ZIP files extracted: {extract_count}/5")
-        logger.info(f"Prescription directories found: {len(prescription_dirs)}")
-        logger.info(f"XML files processed: {xml_count}")
+        logger.info(f"Parts successfully processed: {parts_processed}/5")
+        logger.info(f"Total records extracted: {len(all_records)}")
         logger.info(f"Records inserted to table5: {len(all_records)}")
         logger.info(f"Matched records inserted to joon_ndc_data: [check logs above]")
         logger.info("="*70)
