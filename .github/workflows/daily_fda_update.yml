@@ -31,7 +31,13 @@ jobs:
         SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
         SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
       run: |
-        python daily_automation.py
+        python scripts/truncate_table5.py
+        python scripts/zip1.py
+        python scripts/zip2.py
+        python scripts/zip3.py
+        python scripts/zip4.py
+        python scripts/zip5.py
+        python scripts/modify_finaldatabase.py
     
     - name: Upload logs (if failed)
       if: failure()
